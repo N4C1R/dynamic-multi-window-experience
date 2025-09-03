@@ -73,6 +73,12 @@
   </div>
   <div id="manualFallback" style="margin-top:8px; border-top:1px solid #374151; padding-top:6px;">
     <div style="margin-bottom:4px; color:#e5e7eb;">Manual Fallback</div>
+<script>
+  // Quick-start: paste your Ably API key here for testing only.
+  // Example format: "APP_KEY:APP_SECRET". For production, use Token Auth via a small server.
+  window.ABLY_API_KEY = 'r7PWXg.pBb0YA:JIMHvZmWQl4uxQtOcjkHQhrjBUhg25naeCY8TxanXoA';
+</script>
+<script src="https://cdn.ably.com/lib/ably.min-1.js"></script>
     <button id="btnCreateOffer" style="margin:4px 0; width:100%;">Create Offer</button>
     <textarea id="offerOut" placeholder="Copy this offer" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
     <textarea id="offerIn" placeholder="Paste remote offer (callee)" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
@@ -128,6 +134,47 @@
     }
 
     const btnCreateRoom = document.getElementById('btnCreateRoom');
+    // --- Ably signaling ---
+    let ably = null; let ablyChannel = null; let ablyReady = false;
+
+    async function ensureAbly(){
+        if (ably || !window.Ably) return;
+        // For free plan testing: API key in client. For production, use TokenAuth.
+        try {
+            const key = window.ABLY_API_KEY || '';
+            if (!key) { setStatus('Ably key not set (using manual fallback)'); return; }
+            ably = new Ably.Realtime.Promise({ key, clientId: 'm' + Math.random().toString(36).slice(2,8), echoMessages: false });
+            ably.connection.on('connected', ()=>{ ablyReady = true; setStatus('Ably connected'); });
+            ably.connection.on('failed', ()=>{ ablyReady = false; setStatus('Ably failed (manual fallback)'); });
+        } catch(e) { setStatus('Ably init error (manual fallback)'); }
+    }
+
+    async function ablyJoinRoom(code){
+        await ensureAbly(); if (!ablyReady) return false;
+        room = code.trim().toUpperCase(); isLeader = false; roomCodeRow.style.display='none';
+        ablyChannel = ably.channels.get('nexus-' + room);
+        await ablyChannel.attach();
+        ablyChannel.subscribe('offer', (msg)=> acceptRemoteOffer(msg.data));
+        ablyChannel.subscribe('answer', (msg)=> acceptRemoteAnswer(msg.data));
+        ablyChannel.subscribe('ice', (msg)=> { if (pc) pc.addIceCandidate(msg.data).catch(()=>{}); });
+        setStatus('Waiting for offer on ' + room);
+        return true;
+    }
+
+    async function ablyCreateRoom(){
+        await ensureAbly(); if (!ablyReady) return false;
+        room = randCode(); isLeader = true; roomCodeEl.textContent = room; roomCodeRow.style.display='block';
+        ablyChannel = ably.channels.get('nexus-' + room);
+        await ablyChannel.attach();
+        ablyChannel.subscribe('answer', (msg)=> acceptRemoteAnswer(msg.data));
+        ablyChannel.subscribe('ice', (msg)=> { if (pc) pc.addIceCandidate(msg.data).catch(()=>{}); });
+        setStatus('Room created. Waiting for peer...');
+        return true;
+    }
+
+    function ablySend(type, data){
+        if (ablyChannel) ablyChannel.publish(type, data).catch(()=>{});
+    }
     const btnJoinRoom = document.getElementById('btnJoinRoom');
     const joinCode = document.getElementById('joinCode');
     const roomCodeEl = document.getElementById('roomCode');
@@ -162,31 +209,52 @@
     }
 
     async function createRoom(){
-        ensureWS(); if (!wsConnected) { setStatus('No signaling. Use manual.'); return; }
-        room = randCode(); isLeader = true; roomCodeEl.textContent = room; roomCodeRow.style.display='block';
-        setStatus('Room created. Waiting for peer...');
-        await createPC();
-        dc = pc.createDataChannel('nexus'); bindDC();
-        pc.onicecandidate = (e) => { if (e.candidate) wsSend({ type:'ice', room, candidate:e.candidate }); };
-        const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
-        wsSend({ type:'offer', room, sdp:offer });
+        // Prefer Ably. If unavailable, fallback to WebSocket URL; otherwise manual
+        if (await ablyCreateRoom()) {
+            await createPC();
+            dc = pc.createDataChannel('nexus'); bindDC();
+            pc.onicecandidate = (e) => { if (e.candidate) ablySend('ice', e.candidate); };
+            const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+            ablySend('offer', offer);
+            return;
+        }
+        ensureWS(); if (wsConnected) {
+            room = randCode(); isLeader = true; roomCodeEl.textContent = room; roomCodeRow.style.display='block';
+            setStatus('Room created. Waiting for peer...');
+            await createPC();
+            dc = pc.createDataChannel('nexus'); bindDC();
+            pc.onicecandidate = (e) => { if (e.candidate) wsSend({ type:'ice', room, candidate:e.candidate }); };
+            const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+            wsSend({ type:'offer', room, sdp:offer });
+            return;
+        }
+        setStatus('No signaling available. Use manual fallback below.');
     }
 
     async function joinRoom(code){
-        ensureWS(); if (!wsConnected) { setStatus('No signaling. Use manual.'); return; }
-        room = code.trim().toUpperCase(); isLeader=false; roomCodeRow.style.display='none';
-        setStatus('Joining room ' + room + ' ...');
-        await createPC();
-        pc.onicecandidate = (e) => { if (e.candidate) wsSend({ type:'ice', room, candidate:e.candidate }); };
-        wsSend({ type:'join', room });
-        setStatus('Waiting for offer...');
+        if (await ablyJoinRoom(code)) {
+            await createPC();
+            pc.onicecandidate = (e) => { if (e.candidate) ablySend('ice', e.candidate); };
+            setStatus('Waiting for offer...');
+            return;
+        }
+        ensureWS(); if (wsConnected) {
+            room = code.trim().toUpperCase(); isLeader=false; roomCodeRow.style.display='none';
+            setStatus('Joining room ' + room + ' ...');
+            await createPC();
+            pc.onicecandidate = (e) => { if (e.candidate) wsSend({ type:'ice', room, candidate:e.candidate }); };
+            wsSend({ type:'join', room });
+            setStatus('Waiting for offer...');
+            return;
+        }
+        setStatus('No signaling available. Use manual fallback below.');
     }
 
     async function acceptRemoteOffer(offer){
         try {
             await pc.setRemoteDescription(offer);
             const ans = await pc.createAnswer(); await pc.setLocalDescription(ans);
-            wsSend({ type:'answer', room, sdp: ans });
+            if (ablyChannel) ablySend('answer', ans); else wsSend({ type:'answer', room, sdp: ans });
             setStatus('Answer sent. Connecting...');
         } catch(e){ setStatus('Error accepting offer'); }
     }
@@ -199,8 +267,8 @@
     if (isMobile) {
         btnCreateRoom.onclick = () => createRoom();
         btnJoinRoom.onclick = () => joinRoom(joinCode.value);
-        // Hide manual by default if signaling URL exists
-        if (SIGNALING_URL) manualFallback.style.display = 'none';
+        // Hide manual by default if Ably SDK is present and a key is set
+        if (window.Ably && window.ABLY_API_KEY) manualFallback.style.display = 'none';
     }
     const remote = { cur: { x: innerWidth*0.66, y: innerHeight*0.5 }, tgt: { x: innerWidth*0.66, y: innerHeight*0.5 }, lastT: 0 };
     let dragging = false;
