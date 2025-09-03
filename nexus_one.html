@@ -60,6 +60,18 @@
 </div>
 <canvas id="canvas"></canvas>
 <button id="openWindowBtn" style="display: none;">Launch Nexus 2</button>
+<div id="webrtcPanel" style="display:none; position:absolute; right:1rem; top:1rem; z-index:20; background:rgba(0,0,0,0.5); border:1px solid #374151; border-radius:8px; padding:10px; width:290px; color:#9ca3af; font-size:12px;">
+  <div style="color:#e5e7eb; font-weight:600; margin-bottom:6px;">Mobile P2P (WebRTC)</div>
+  <div id="rtcStatus" style="margin-bottom:6px;">Status: Idle</div>
+  <button id="btnCreateOffer" style="margin:4px 0; width:100%;">Create Offer</button>
+  <textarea id="offerOut" placeholder="Copy this offer" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
+  <textarea id="offerIn" placeholder="Paste remote offer (callee)" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
+  <button id="btnAcceptOffer" style="margin:4px 0; width:100%;">Accept Offer (Create Answer)</button>
+  <textarea id="answerOut" placeholder="Copy this answer" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
+  <textarea id="answerIn" placeholder="Paste remote answer (caller)" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
+  <button id="btnAcceptAnswer" style="margin:4px 0; width:100%;">Accept Answer</button>
+  <div style="margin-top:6px; font-size:11px;">Tip: Exchange one Offer and one Answer between phones. ICE is bundled to avoid extra steps.</div>
+</div>
 
 <script type="module">
         import { getClientAreaPosition, resizeCanvasHiDPI, drawBackgroundShared, lerpColor, calculateDistance, Particle, updateParticleListShared, drawCore, drawPartnerCoreOverlay, drawMergeArcs } from './nexus_shared.js';
@@ -81,6 +93,30 @@
     const infoStatus = document.querySelector('.info');
     const openBtn = document.getElementById('openWindowBtn');
 
+    // --- MOBILE MODE (P2P) SWITCH ---
+    const isMobile = matchMedia('(pointer: coarse)').matches || innerWidth < 850;
+    const webrtcPanel = document.getElementById('webrtcPanel');
+    const rtcStatusEl = document.getElementById('rtcStatus');
+    const btnCreateOffer = document.getElementById('btnCreateOffer');
+    const btnAcceptOffer = document.getElementById('btnAcceptOffer');
+    const btnAcceptAnswer = document.getElementById('btnAcceptAnswer');
+    const offerOut = document.getElementById('offerOut');
+    const offerIn = document.getElementById('offerIn');
+    const answerOut = document.getElementById('answerOut');
+    const answerIn = document.getElementById('answerIn');
+
+    // Local/remote cores for mobile P2P mode (single canvas)
+    const coreA = { x: innerWidth*0.33, y: innerHeight*0.5 };
+    const remote = { cur: { x: innerWidth*0.66, y: innerHeight*0.5 }, tgt: { x: innerWidth*0.66, y: innerHeight*0.5 }, lastT: 0 };
+    let dragging = false;
+
+    // WebRTC objects
+    let pc = null; let dc = null; let isCaller = false;
+    let transport = { send: (m)=>{ if (dc && dc.readyState==='open') dc.send(JSON.stringify(m)); } };
+
+    if (isMobile) {
+        webrtcPanel.style.display = 'block';
+    }
     let otherWindowPos = null;
     let lastSeenTimestamp = 0;
     let particles = [];
@@ -114,20 +150,108 @@
         });
         resizeCanvas();
 
-        channel.postMessage({ type: 'ping', id: WINDOW_ID });
-        const attemptOpen = () => {
-            if (!partnerFound && !popupBlocked) {
-                const w = window.open('nexus_two.html', 'PortalWindow2', 'width=480,height=420,left=600,top=200');
-                if (!w) {
-                    popupBlocked = true;
-                    openBtn.style.display = 'block';
+    // --- Touch controls (mobile) ---
+    if (isMobile) {
+        canvas.addEventListener('pointerdown', (e)=>{
+            const p = { x: e.offsetX, y: e.offsetY };
+            dragging = Math.hypot(p.x-coreA.x, p.y-coreA.y) < 56;
+        }, {passive:true});
+        canvas.addEventListener('pointermove', (e)=>{
+            if (!dragging) return;
+            coreA.x = e.offsetX; coreA.y = e.offsetY;
+            maybeSendPos();
+        }, {passive:true});
+        canvas.addEventListener('pointerup', ()=>{ dragging=false; }, {passive:true});
+        canvas.addEventListener('pointercancel', ()=>{ dragging=false; }, {passive:true});
+    }
+
+    function maybeSendPos(){
+        const now = performance.now();
+        if (!maybeSendPos._t) maybeSendPos._t = 0;
+        if (now - maybeSendPos._t > 50) {
+            transport.send({ type:'pos', t: Date.now(), x: coreA.x, y: coreA.y });
+            maybeSendPos._t = now;
+        }
+    }
+
+    function smoothRemote(dt = 0.12){
+        remote.cur.x += (remote.tgt.x - remote.cur.x) * dt;
+        remote.cur.y += (remote.tgt.y - remote.cur.y) * dt;
+    }
+        if (!isMobile) {
+            channel.postMessage({ type: 'ping', id: WINDOW_ID });
+            const attemptOpen = () => {
+                if (!partnerFound && !popupBlocked) {
+                    const w = window.open('nexus_two.html', 'PortalWindow2', 'width=480,height=420,left=600,top=200');
+                    if (!w) {
+                        popupBlocked = true;
+                        openBtn.style.display = 'block';
+                    }
                 }
+            };
+            setTimeout(attemptOpen, 250);
+            setTimeout(attemptOpen, 2000);
+        } else {
+            // Hide desktop launch button in mobile mode
+            openBtn.style.display = 'none';
+        }
+
+        // Initialize animation
+        animate();
+    }
+
+    // --- WebRTC manual signaling helpers (bundle-only SDP to reduce steps) ---
+    async function createPC() {
+        pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        pc.onicegatheringstatechange = () => {
+            if (pc.iceGatheringState === 'complete') {
+                const sdp = pc.localDescription;
+                const text = btoa(JSON.stringify(sdp));
+                if (isCaller) offerOut.value = text; else answerOut.value = text;
             }
         };
-        setTimeout(attemptOpen, 250);
-        setTimeout(attemptOpen, 2000);
+        pc.onconnectionstatechange = () => { rtcStatusEl.textContent = 'Status: ' + pc.connectionState; };
+        if (!isCaller) {
+            pc.ondatachannel = (e) => { dc = e.channel; bindDC(); };
+        }
+        return pc;
+    }
 
-        animate();
+    function bindDC(){
+        dc.onopen = ()=>{ rtcStatusEl.textContent = 'Status: Connected'; };
+        dc.onclose = ()=>{ rtcStatusEl.textContent = 'Status: Closed'; };
+        dc.onmessage = (ev)=>{
+            try { const m = JSON.parse(ev.data); onMessage(m); } catch(e) {}
+        };
+    }
+
+    function onMessage(m){
+        if (m.type === 'pos') {
+            remote.tgt.x = m.x; remote.tgt.y = m.y; remote.lastT = m.t || Date.now();
+        }
+    }
+
+    if (isMobile) {
+        btnCreateOffer.onclick = async () => {
+            isCaller = true; await createPC();
+            dc = pc.createDataChannel('nexus'); bindDC();
+            const offer = await pc.createOffer({ iceRestart: false });
+            await pc.setLocalDescription(offer);
+            rtcStatusEl.textContent = 'Status: Offer ready (copy)';
+        };
+        btnAcceptOffer.onclick = async () => {
+            isCaller = false; await createPC();
+            const remoteOffer = JSON.parse(atob(offerIn.value.trim()));
+            await pc.setRemoteDescription(remoteOffer);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            rtcStatusEl.textContent = 'Status: Answer ready (copy)';
+        };
+        btnAcceptAnswer.onclick = async () => {
+            const remoteAnswer = JSON.parse(atob(answerIn.value.trim()));
+            await pc.setRemoteDescription(remoteAnswer);
+            rtcStatusEl.textContent = 'Status: Connecting...';
+        };
     }
 
     function resizeCanvas() {
@@ -199,14 +323,42 @@
         ctx.clearRect(0, 0, window.innerWidth, window.innerHeight);
         drawBackgroundShared(ctx, stars, nebulaColors, window.screenX, window.screenY, window.innerWidth, window.innerHeight);
 
+        ringAngle1 += 0.01; ringAngle2 -= 0.005;
+
+        if (isMobile) {
+            // Single-canvas dual-core rendering
+            smoothRemote();
+            // Update particles for both directions (reuse existing list, fewer spawns)
+            const dx = remote.cur.x - coreA.x, dy = remote.cur.y - coreA.y;
+            const dist = Math.hypot(dx, dy);
+            if (particles.length < PARTICLE_COUNT && Math.random() > 0.3) {
+                const ang = Math.atan2(dy, dx), sp=2.2, spawnR=40;
+                particles.push(new Particle({ x: coreA.x+Math.cos(ang)*spawnR, y: coreA.y+Math.sin(ang)*spawnR, vx: Math.cos(ang)*sp, vy: Math.sin(ang)*sp, color: PARTICLE_COLOR, targetX: remote.cur.x, targetY: remote.cur.y }));
+                particles.push(new Particle({ x: remote.cur.x-Math.cos(ang)*spawnR, y: remote.cur.y-Math.sin(ang)*spawnR, vx: -Math.cos(ang)*sp, vy: -Math.sin(ang)*sp, color: 'rgba(74, 222, 128, 0.9)', targetX: coreA.x, targetY: coreA.y }));
+            }
+            // Update/draw particles
+            for (let i=particles.length-1;i>=0;i--) {
+                const p=particles[i];
+                const ax = (p.targetX===remote.cur.x && p.targetY===remote.cur.y) ? remote.cur.x : coreA.x;
+                const ay = (p.targetX===remote.cur.x && p.targetY===remote.cur.y) ? remote.cur.y : coreA.y;
+                p.update(ax, ay, Math.max(0, 1 - dist/ATTRACTION_RADIUS));
+                p.draw(ctx);
+                if (p.life<=0) particles.splice(i,1);
+            }
+            // Draw cores and arcs
+            drawCore(ctx, coreA.x, coreA.y, CORE_COLOR, 40, ringAngle1, ringAngle2);
+            drawCore(ctx, remote.cur.x, remote.cur.y, '#16a34a', 40, ringAngle1, ringAngle2);
+            drawMergeArcs(ctx, coreA.x, coreA.y, remote.cur.x, remote.cur.y);
+
+            requestAnimationFrame(animate);
+            return;
+        }
+
+        // Desktop multi-window logic (unchanged)
         const myPos = getClientAreaPosition();
         channel.postMessage({ type: 'pos1', data: myPos });
 
         const otherWindowPresent = Date.now() - lastSeenTimestamp < 1500;
-
-        ringAngle1 += 0.01;
-        ringAngle2 -= 0.005;
-
         if (!otherWindowPresent) {
             handleNoLink(myPos);
             requestAnimationFrame(animate);
@@ -224,13 +376,11 @@
             infoStatus.innerHTML = `<strong>Core Nexus 1</strong><br>Status: Filaments Active`;
             updateAndDrawFilaments(myPos, otherWindowPos, dist);
             drawCore(ctx, myPos.cx, myPos.cy, CORE_COLOR, 40, ringAngle1, ringAngle2);
-            // Energy arcs between cores
             drawMergeArcs(ctx, myPos.cx, myPos.cy, otherWindowPos.x - myPos.x + otherWindowPos.cx, otherWindowPos.y - myPos.y + otherWindowPos.cy);
         } else {
             infoStatus.innerHTML = `<strong>Core Nexus 1</strong><br>Status: Stable`;
             drawCore(ctx, myPos.cx, myPos.cy, CORE_COLOR, 40, ringAngle1, ringAngle2);
         }
-        // Show partner core overlay for visibility when overlapping
         drawPartnerCoreOverlay(ctx, myPos, otherWindowPos, '#16a34a', ringAngle1, ringAngle2);
 
         ghostParticles.forEach(p => new Particle(p).draw(ctx));
