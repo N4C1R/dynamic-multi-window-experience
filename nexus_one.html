@@ -63,14 +63,24 @@
 <div id="webrtcPanel" style="display:none; position:absolute; right:1rem; top:1rem; z-index:20; background:rgba(0,0,0,0.5); border:1px solid #374151; border-radius:8px; padding:10px; width:290px; color:#9ca3af; font-size:12px;">
   <div style="color:#e5e7eb; font-weight:600; margin-bottom:6px;">Mobile P2P (WebRTC)</div>
   <div id="rtcStatus" style="margin-bottom:6px;">Status: Idle</div>
-  <button id="btnCreateOffer" style="margin:4px 0; width:100%;">Create Offer</button>
-  <textarea id="offerOut" placeholder="Copy this offer" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
-  <textarea id="offerIn" placeholder="Paste remote offer (callee)" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
-  <button id="btnAcceptOffer" style="margin:4px 0; width:100%;">Accept Offer (Create Answer)</button>
-  <textarea id="answerOut" placeholder="Copy this answer" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
-  <textarea id="answerIn" placeholder="Paste remote answer (caller)" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
-  <button id="btnAcceptAnswer" style="margin:4px 0; width:100%;">Accept Answer</button>
-  <div style="margin-top:6px; font-size:11px;">Tip: Exchange one Offer and one Answer between phones. ICE is bundled to avoid extra steps.</div>
+  <div style="display:flex; gap:6px; margin-bottom:6px;">
+    <button id="btnCreateRoom" style="flex:1;">Create Room</button>
+    <input id="joinCode" placeholder="Enter code" style="flex:1; padding:4px;"/>
+    <button id="btnJoinRoom">Join</button>
+  </div>
+  <div id="roomCodeRow" style="display:none; margin-bottom:6px;">
+    Room Code: <span id="roomCode" style="color:#e5e7eb; font-weight:600;"></span>
+  </div>
+  <div id="manualFallback" style="margin-top:8px; border-top:1px solid #374151; padding-top:6px;">
+    <div style="margin-bottom:4px; color:#e5e7eb;">Manual Fallback</div>
+    <button id="btnCreateOffer" style="margin:4px 0; width:100%;">Create Offer</button>
+    <textarea id="offerOut" placeholder="Copy this offer" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
+    <textarea id="offerIn" placeholder="Paste remote offer (callee)" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
+    <button id="btnAcceptOffer" style="margin:4px 0; width:100%;">Accept Offer (Create Answer)</button>
+    <textarea id="answerOut" placeholder="Copy this answer" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
+    <textarea id="answerIn" placeholder="Paste remote answer (caller)" style="width:100%; height:70px; margin-bottom:6px;"></textarea>
+    <button id="btnAcceptAnswer" style="margin:4px 0; width:100%;">Accept Answer</button>
+  </div>
 </div>
 
 <script type="module">
@@ -107,6 +117,91 @@
 
     // Local/remote cores for mobile P2P mode (single canvas)
     const coreA = { x: innerWidth*0.33, y: innerHeight*0.5 };
+    // Signaling via WebSocket (configurable URL), fallback to manual
+    const SIGNALING_URL = (window.NEXUS_SIGNALING_URL || ''); // e.g., wss://example.com/signaling
+    let ws = null; let room = null; let isLeader = false; let wsConnected = false;
+
+    function randCode(n=6){
+        const chars = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+        let s=''; for(let i=0;i<n;i++) s+=chars[(Math.random()*chars.length)|0];
+        return s;
+    }
+
+    const btnCreateRoom = document.getElementById('btnCreateRoom');
+    const btnJoinRoom = document.getElementById('btnJoinRoom');
+    const joinCode = document.getElementById('joinCode');
+    const roomCodeEl = document.getElementById('roomCode');
+    const roomCodeRow = document.getElementById('roomCodeRow');
+    const manualFallback = document.getElementById('manualFallback');
+
+    function setStatus(s){ rtcStatusEl.textContent = 'Status: ' + s; }
+
+    function ensureWS(){
+        if (ws || !SIGNALING_URL) return;
+        try {
+            ws = new WebSocket(SIGNALING_URL);
+            ws.onopen = ()=>{ wsConnected = true; setStatus('Signaling connected'); };
+            ws.onclose = ()=>{ wsConnected = false; setStatus('Signaling unavailable (using manual)'); };
+            ws.onmessage = (ev)=>{ try{ const m = JSON.parse(ev.data); onSignal(m); }catch(e){} };
+        } catch(e) { setStatus('Signaling error (manual only)'); }
+    }
+
+    function wsSend(obj){ if (ws && ws.readyState===1) ws.send(JSON.stringify(obj)); }
+
+    function onSignal(m){
+        if (!m || m.room !== room) return;
+        if (m.type === 'roomStatus') {
+            if (m.ok === false) setStatus(m.reason || 'Room error');
+        } else if (m.type === 'offer' && !isLeader) {
+            acceptRemoteOffer(m.sdp);
+        } else if (m.type === 'answer' && isLeader) {
+            acceptRemoteAnswer(m.sdp);
+        } else if (m.type === 'ice') {
+            if (pc) pc.addIceCandidate(m.candidate).catch(()=>{});
+        }
+    }
+
+    async function createRoom(){
+        ensureWS(); if (!wsConnected) { setStatus('No signaling. Use manual.'); return; }
+        room = randCode(); isLeader = true; roomCodeEl.textContent = room; roomCodeRow.style.display='block';
+        setStatus('Room created. Waiting for peer...');
+        await createPC();
+        dc = pc.createDataChannel('nexus'); bindDC();
+        pc.onicecandidate = (e) => { if (e.candidate) wsSend({ type:'ice', room, candidate:e.candidate }); };
+        const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+        wsSend({ type:'offer', room, sdp:offer });
+    }
+
+    async function joinRoom(code){
+        ensureWS(); if (!wsConnected) { setStatus('No signaling. Use manual.'); return; }
+        room = code.trim().toUpperCase(); isLeader=false; roomCodeRow.style.display='none';
+        setStatus('Joining room ' + room + ' ...');
+        await createPC();
+        pc.onicecandidate = (e) => { if (e.candidate) wsSend({ type:'ice', room, candidate:e.candidate }); };
+        wsSend({ type:'join', room });
+        setStatus('Waiting for offer...');
+    }
+
+    async function acceptRemoteOffer(offer){
+        try {
+            await pc.setRemoteDescription(offer);
+            const ans = await pc.createAnswer(); await pc.setLocalDescription(ans);
+            wsSend({ type:'answer', room, sdp: ans });
+            setStatus('Answer sent. Connecting...');
+        } catch(e){ setStatus('Error accepting offer'); }
+    }
+
+    async function acceptRemoteAnswer(answer){
+        try { await pc.setRemoteDescription(answer); setStatus('Connecting...'); }
+        catch(e){ setStatus('Error accepting answer'); }
+    }
+
+    if (isMobile) {
+        btnCreateRoom.onclick = () => createRoom();
+        btnJoinRoom.onclick = () => joinRoom(joinCode.value);
+        // Hide manual by default if signaling URL exists
+        if (SIGNALING_URL) manualFallback.style.display = 'none';
+    }
     const remote = { cur: { x: innerWidth*0.66, y: innerHeight*0.5 }, tgt: { x: innerWidth*0.66, y: innerHeight*0.5 }, lastT: 0 };
     let dragging = false;
 
